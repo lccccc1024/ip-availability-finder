@@ -22,25 +22,35 @@ jobs:
       - name: Restore with locked dependencies, audit, and publish
         shell: pwsh
         run: .\build.ps1
-      - name: Create v1.0.0 release and upload executable
+      - name: Publish v1.0.0 release and upload executable
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $exe = Join-Path $PWD 'dist\未占用IP查找.exe'
+          $builtExe = Join-Path $PWD 'dist\未占用IP查找.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'IP.exe'
+          Copy-Item -LiteralPath $builtExe -Destination $exe
           $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           $checksumPath = Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
           $notes = @(
             'Windows x64 免安装版。支持 /16–/30 IPv4 网段按数量查找与全量扫描，可选网关探测，并可复制扫描结果。'
             ''
-            '下载未占用IP查找.exe 后直接运行，适用于 Windows 10 版本 2004（19041）及更新版本。'
+            '下载 IP.exe 后直接运行，适用于 Windows 10 版本 2004（19041）及更新版本。'
             ''
             '**使用前注意：**连续两次 ping 未回应的 IP 仅标记为“待确认”；分配前请核对 DHCP、静态预留及网络管理记录。本版本未进行代码签名。'
             ''
             "SHA-256：$sha"
           ) -join "`n"
           [IO.File]::WriteAllText($notesPath, $notes, [Text.UTF8Encoding]::new($false))
-          [IO.File]::WriteAllText($checksumPath, "$sha *未占用IP查找.exe`n", [Text.UTF8Encoding]::new($false))
-          gh release create v1.0.0 $exe $checksumPath --title '未占用IP查找 v1.0.0' --notes-file $notesPath --target $env:GITHUB_SHA
+          [IO.File]::WriteAllText($checksumPath, "$sha *IP.exe`n", [Text.UTF8Encoding]::new($false))
+          gh release view v1.0.0 *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload v1.0.0 $exe $checksumPath --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit v1.0.0 --title '未占用IP查找 v1.0.0' --notes-file $notesPath
+          } else {
+            gh release create v1.0.0 $exe $checksumPath --title '未占用IP查找 v1.0.0' --notes-file $notesPath --target $env:GITHUB_SHA
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
