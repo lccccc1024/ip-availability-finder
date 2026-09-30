@@ -1,0 +1,25 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Test scanner and clipboard behavior
+        shell: pwsh
+        run: .\test-winui.ps1
+      - name: Restore with locked dependencies, audit, and publish
+        shell: pwsh
+        run: .\build.ps1
