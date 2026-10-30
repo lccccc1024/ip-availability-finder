@@ -1,0 +1,17 @@
+version: 2
+
+updates:
+  # 只跟踪 GitHub Actions。
+  # NuGet 故意不开：本仓库用 RestorePackagesWithLockFile + `--locked-mode` 恢复，
+  # 而 Dependabot 不会同步更新 winui/packages.lock.json，它提的更新 PR 会卡在 NU1004 上。
+  # 升级 NuGet 依赖时请手动执行：
+  #   dotnet restore .\winui\PingCandidateFinder.WinUI.csproj --force-evaluate
+  # 并提交 packages.lock.json。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci(deps)"
