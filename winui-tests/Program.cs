@@ -30,7 +30,7 @@ Require(!Scanner.TryAddress("+1.2.3.4", out _) && !Scanner.TryAddress("1. 2.3.4"
 ScanOptions options = Scanner.Parse("192.168.1.99", "255.255.255.248", "192.168.1.98",
     "192.168.1.101", "2");
 ScanProgress scan = Scanner.Scan(options, CancellationToken.None, _ => { },
-    (address, _) => address == Parse("192.168.1.101") ? ProbeResult.Replied : ProbeResult.TimedOut);
+    (address, _) => Task.FromResult(address == Parse("192.168.1.101") ? ProbeResult.Replied : ProbeResult.TimedOut));
 Require(scan.Checked == 3 && scan.Candidates.SequenceEqual(new[] { "192.168.1.102", "192.168.1.97" }),
     "scan order and wrap");
 
@@ -45,12 +45,12 @@ ScanProgress full = Scanner.Scan(fullOptions, CancellationToken.None, progress =
     reportedCandidates.AddRange(progress.Candidates);
     reportedReplied.AddRange(progress.RepliedAddresses);
     reportedUnknown.AddRange(progress.UnknownAddresses);
-}, (address, _) => address switch
+}, (address, _) => Task.FromResult(address switch
 {
     var value when value == Parse("10.7.3.42") || value == Parse("10.7.3.46") => ProbeResult.Replied,
     var value when value == Parse("10.7.3.44") => ProbeResult.Unknown,
     _ => ProbeResult.TimedOut
-});
+}));
 Require(fullOptions.FullScan && fullOptions.Total == 5 && full.Checked == 5,
     "full scan checks every eligible address despite requested count of one");
 Require(full.Replied == 2 && full.Unknown == 1 && full.CandidateCount == 2,
@@ -69,7 +69,7 @@ ScanProgress large = Scanner.Scan(largeOptions, CancellationToken.None, progress
 {
     streamedCandidates += progress.Candidates.Count;
     largestUpdate = Math.Max(largestUpdate, progress.Candidates.Count);
-}, (_, _) => ProbeResult.TimedOut);
+}, (_, _) => Task.FromResult(ProbeResult.TimedOut));
 Require(large.Checked == 65534 && large.CandidateCount == 65534
     && streamedCandidates == 65534 && largestUpdate <= 128,
     "/16 full scan streams bounded updates and completes");
@@ -78,10 +78,10 @@ ScanOptions cancelOptions = Scanner.Parse("10.9.0.0", "/24", "", "", "", true);
 using CancellationTokenSource cancellation = new();
 using ManualResetEventSlim probeStarted = new();
 Task<ScanProgress> cancelledScan = Task.Run(() => Scanner.Scan(cancelOptions, cancellation.Token,
-    _ => { }, (_, probeToken) =>
+    _ => { }, async (_, probeToken) =>
     {
         probeStarted.Set();
-        probeToken.WaitHandle.WaitOne();
+        await Task.Delay(Timeout.Infinite, probeToken).ConfigureAwait(false);
         return ProbeResult.Unknown;
     }));
 Require(probeStarted.Wait(TimeSpan.FromSeconds(5)), "cancel test started a probe");
@@ -89,6 +89,58 @@ cancellation.Cancel();
 Require(cancelledScan.Wait(TimeSpan.FromSeconds(5)) && cancelledScan.Result.Checked == 0,
     "cancellation ends scan without counting unfinished probes");
 Require(Scanner.GatewayResponds(Parse("127.0.0.1"), CancellationToken.None), "ICMP loopback");
+
+// 网关本身不参与扫描
+ScanOptions gatewayOptions = Scanner.Parse("10.12.0.0", "/29", "10.12.0.3", "", "1", true);
+HashSet<uint> probedAddresses = new();
+ScanProgress gatewayScan = Scanner.Scan(gatewayOptions, CancellationToken.None, _ => { }, (address, _) =>
+{
+    probedAddresses.Add(address);
+    return Task.FromResult(ProbeResult.Replied);
+});
+Require(!probedAddresses.Contains(Parse("10.12.0.3")), "gateway is never probed");
+Require(probedAddresses.Count == gatewayOptions.Total && gatewayScan.Checked == gatewayOptions.Total,
+    "every eligible host is probed exactly once");
+
+// 凑够候选就停，不会把整批扫完
+ScanOptions earlyStopOptions = Scanner.Parse("10.13.0.0", "/24", "", "", "3");
+ScanProgress earlyStop = Scanner.Scan(earlyStopOptions, CancellationToken.None, _ => { },
+    (_, _) => Task.FromResult(ProbeResult.TimedOut));
+Require(earlyStop.Checked == 3 && earlyStop.CandidateCount == 3, "stops as soon as enough candidates are found");
+Require(earlyStop.Candidates.SequenceEqual(new[] { "10.13.0.1", "10.13.0.2", "10.13.0.3" }),
+    "candidates keep address order");
+
+// 无法判断的地址不算待确认，也不阻塞后续地址
+ScanOptions unknownOptions = Scanner.Parse("10.14.0.0", "/29", "", "", "1", true);
+ScanProgress unknownScan = Scanner.Scan(unknownOptions, CancellationToken.None, _ => { },
+    (_, _) => Task.FromResult(ProbeResult.Unknown));
+Require(unknownScan.Checked == 6 && unknownScan.Unknown == 6 && unknownScan.CandidateCount == 0,
+    "unknown responses are reported separately from candidates");
+
+// 探测必须真正并发：串行执行会远超时间上限
+ScanOptions concurrentOptions = Scanner.Parse("10.15.0.0", "/24", "", "", "1", true);
+object flightGate = new();
+int inFlight = 0;
+int peakInFlight = 0;
+System.Diagnostics.Stopwatch concurrentWatch = System.Diagnostics.Stopwatch.StartNew();
+ScanProgress concurrentScan = Scanner.Scan(concurrentOptions, CancellationToken.None, _ => { }, async (_, probeToken) =>
+{
+    lock (flightGate)
+    {
+        inFlight++;
+        peakInFlight = Math.Max(peakInFlight, inFlight);
+    }
+
+    await Task.Delay(50, probeToken).ConfigureAwait(false);
+
+    lock (flightGate) inFlight--;
+    return ProbeResult.Replied;
+});
+concurrentWatch.Stop();
+Require(concurrentScan.Checked == 254, "concurrency test checks the whole /24");
+Require(peakInFlight >= 32, $"probes run concurrently in flight (peak {peakInFlight})");
+Require(concurrentWatch.Elapsed < TimeSpan.FromSeconds(5),
+    $"probes are not serialized (took {concurrentWatch.ElapsedMilliseconds} ms)");
 
 string? clipboard = null;
 int writes = 0;

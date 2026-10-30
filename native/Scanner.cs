@@ -123,7 +123,7 @@ namespace PingCandidateFinder
                 (address >> 8) & 255, address & 255);
         }
 
-        private static ProbeResult Probe(uint address, CancellationToken token)
+        private static async Task<ProbeResult> ProbeAsync(uint address, CancellationToken token)
         {
             for (int attempt = 0; attempt < 2; attempt++)
             {
@@ -132,9 +132,9 @@ namespace PingCandidateFinder
                 {
                     using (Ping ping = new Ping())
                     {
-                        PingReply reply = ping.SendPingAsync(Format(address),
+                        PingReply reply = await ping.SendPingAsync(Format(address),
                             TimeSpan.FromMilliseconds(600), cancellationToken: token)
-                            .GetAwaiter().GetResult();
+                            .ConfigureAwait(false);
                         if (reply.Status == IPStatus.Success) return ProbeResult.Replied;
                         if (reply.Status != IPStatus.TimedOut) return ProbeResult.Unknown;
                     }
@@ -148,7 +148,7 @@ namespace PingCandidateFinder
 
         public static bool GatewayResponds(uint address, CancellationToken token)
         {
-            return Probe(address, token) == ProbeResult.Replied;
+            return ProbeAsync(address, token).GetAwaiter().GetResult() == ProbeResult.Replied;
         }
 
         private static IEnumerable<uint> Addresses(ScanOptions options)
@@ -164,34 +164,44 @@ namespace PingCandidateFinder
 
         public static ScanProgress Scan(ScanOptions options, CancellationToken token, Action<ScanProgress> report)
         {
-            return Scan(options, token, report, Probe);
+            return Scan(options, token, report, ProbeAsync);
         }
 
         internal static ScanProgress Scan(ScanOptions options, CancellationToken token,
-            Action<ScanProgress> report, Func<uint, CancellationToken, ProbeResult> prober)
+            Action<ScanProgress> report, Func<uint, CancellationToken, Task<ProbeResult>> prober)
+        {
+            return ScanAsync(options, token, report, prober).GetAwaiter().GetResult();
+        }
+
+        private static async Task<ScanProgress> ScanAsync(ScanOptions options, CancellationToken token,
+            Action<ScanProgress> report, Func<uint, CancellationToken, Task<ProbeResult>> prober)
         {
             ScanProgress progress = new ScanProgress { Total = options.Total };
             int batchSize = Math.Min(256, Math.Max(32, options.Count * 4));
             List<uint> batch = new List<uint>();
-            int reportedCandidates = 0;
-            int reportedReplied = 0;
-            int reportedUnknown = 0;
+            ReportState reported = new ReportState();
             foreach (uint address in Addresses(options))
             {
                 if (token.IsCancellationRequested || ShouldStop(options, progress)) break;
                 batch.Add(address);
                 if (batch.Count < batchSize) continue;
-                CommitBatch(batch, token, options, progress, report, prober,
-                    ref reportedCandidates, ref reportedReplied, ref reportedUnknown);
+                await CommitBatchAsync(batch, token, options, progress, report, prober, reported).ConfigureAwait(false);
                 batch.Clear();
                 if (!options.FullScan && progress.Checked >= 512 && progress.Candidates.Count == 0) batchSize = 256;
             }
             if (!token.IsCancellationRequested && !ShouldStop(options, progress) && batch.Count > 0)
-                CommitBatch(batch, token, options, progress, report, prober,
-                    ref reportedCandidates, ref reportedReplied, ref reportedUnknown);
-            EmitProgress(progress, report, ref reportedCandidates, ref reportedReplied, ref reportedUnknown);
+                await CommitBatchAsync(batch, token, options, progress, report, prober, reported).ConfigureAwait(false);
+            EmitProgress(progress, report, reported);
             progress.CandidateCount = progress.Candidates.Count;
             return progress;
+        }
+
+        /// <summary>已上报的条目数，用于只把新增部分推给界面。</summary>
+        private sealed class ReportState
+        {
+            public int Candidates;
+            public int Replied;
+            public int Unknown;
         }
 
         private static bool ShouldStop(ScanOptions options, ScanProgress progress)
@@ -199,33 +209,35 @@ namespace PingCandidateFinder
             return !options.FullScan && progress.Candidates.Count >= options.Count;
         }
 
-        private static void EmitProgress(ScanProgress progress, Action<ScanProgress> report,
-            ref int reportedCandidates, ref int reportedReplied, ref int reportedUnknown)
+        private static void EmitProgress(ScanProgress progress, Action<ScanProgress> report, ReportState reported)
         {
-            report(progress.CloneSince(reportedCandidates, reportedReplied, reportedUnknown));
-            reportedCandidates = progress.Candidates.Count;
-            reportedReplied = progress.RepliedAddresses.Count;
-            reportedUnknown = progress.UnknownAddresses.Count;
+            report(progress.CloneSince(reported.Candidates, reported.Replied, reported.Unknown));
+            reported.Candidates = progress.Candidates.Count;
+            reported.Replied = progress.RepliedAddresses.Count;
+            reported.Unknown = progress.UnknownAddresses.Count;
         }
 
-        private static void CommitBatch(List<uint> batch, CancellationToken token, ScanOptions options,
-            ScanProgress progress, Action<ScanProgress> report, Func<uint, CancellationToken, ProbeResult> prober,
-            ref int reportedCandidates, ref int reportedReplied, ref int reportedUnknown)
+        private static async Task CommitBatchAsync(List<uint> batch, CancellationToken token, ScanOptions options,
+            ScanProgress progress, Action<ScanProgress> report,
+            Func<uint, CancellationToken, Task<ProbeResult>> prober, ReportState reported)
         {
             using CancellationTokenSource batchCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
             Task<ProbeResult>[] tasks = new Task<ProbeResult>[batch.Count];
-            for (int i = 0; i < batch.Count; i++)
-            {
-                uint address = batch[i];
-                tasks[i] = Task.Run(() => prober(address, batchCancellation.Token), batchCancellation.Token);
-            }
             try
             {
+                // 直接启动探测，不再为每个地址占一个线程池线程：
+                // 探测本身是异步 ICMP，整批可以真正并发在途。
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    uint address = batch[i];
+                    tasks[i] = prober(address, batchCancellation.Token);
+                }
+
                 for (int i = 0; i < tasks.Length; i++)
                 {
                     if (token.IsCancellationRequested || ShouldStop(options, progress)) return;
                     ProbeResult result;
-                    try { result = tasks[i].WaitAsync(token).GetAwaiter().GetResult(); }
+                    try { result = await tasks[i].WaitAsync(token).ConfigureAwait(false); }
                     catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
                     if (token.IsCancellationRequested) return;
                     progress.Checked++;
@@ -243,7 +255,7 @@ namespace PingCandidateFinder
                     if (i == tasks.Length - 1 || ShouldStop(options, progress)
                         || progress.Checked % (options.FullScan ? 128 : 16) == 0
                         || (!options.FullScan && result == ProbeResult.TimedOut && progress.Candidates.Count == 1))
-                        EmitProgress(progress, report, ref reportedCandidates, ref reportedReplied, ref reportedUnknown);
+                        EmitProgress(progress, report, reported);
                 }
             }
             finally { batchCancellation.Cancel(); }
