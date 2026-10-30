@@ -177,7 +177,9 @@ public sealed partial class MainWindow : Window
         }
 
         SaveSettings();
-        _cancel?.Dispose();
+        // 不 Dispose 上一轮的 CTS：它的 token 可能仍被上一轮未完成的 ping / WaitAsync 使用，
+        // Dispose 会让它们抛 ObjectDisposedException。Cancel + 交给 GC 即可。
+        _cancel?.Cancel();
         _cancel = new CancellationTokenSource();
         CancellationToken token = _cancel.Token;
         int generation = ++_generation;
