@@ -125,6 +125,7 @@ namespace PingCandidateFinder
 
         private static async Task<ProbeResult> ProbeAsync(uint address, CancellationToken token)
         {
+            bool sawTimeout = false;
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 if (token.IsCancellationRequested) return ProbeResult.Unknown;
@@ -137,13 +138,16 @@ namespace PingCandidateFinder
                             .ConfigureAwait(false);
                         if (reply.Status == IPStatus.Success) return ProbeResult.Replied;
                         if (reply.Status != IPStatus.TimedOut) return ProbeResult.Unknown;
+                        sawTimeout = true;
                     }
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { return ProbeResult.Unknown; }
-                catch (PingException) { return ProbeResult.Unknown; }
-                catch (SocketException) { return ProbeResult.Unknown; }
+                // 传输层异常时保留已经观测到的结论：先超时后异常仍算"两次未响应"，归为待确认，
+                // 而不是把同一台主机归类成"无法判断"。
+                catch (PingException) { break; }
+                catch (SocketException) { break; }
             }
-            return ProbeResult.TimedOut;
+            return sawTimeout ? ProbeResult.TimedOut : ProbeResult.Unknown;
         }
 
         public static bool GatewayResponds(uint address, CancellationToken token)
@@ -156,8 +160,18 @@ namespace PingCandidateFinder
             uint first = options.Network + 1;
             uint last = options.Broadcast - 1;
             uint start = options.Start.HasValue ? options.Start.Value : first;
-            for (uint address = start; address <= last; address++)
-                if (!options.Gateway.HasValue || address != options.Gateway.Value) yield return address;
+
+            // 用"到达 last 就 break"替代 address <= last：否则 address 自增到 uint.MaxValue 会回绕成 0，
+            // 条件重新成立，扫描永不结束。Parse 已限制 /16–/30，这里是防回绕的硬约束。
+            if (start <= last)
+            {
+                for (uint address = start; ; address++)
+                {
+                    if (!options.Gateway.HasValue || address != options.Gateway.Value) yield return address;
+                    if (address == last) break;
+                }
+            }
+
             for (uint address = first; address < start; address++)
                 if (!options.Gateway.HasValue || address != options.Gateway.Value) yield return address;
         }
