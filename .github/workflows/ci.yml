@@ -16,7 +16,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 8.0.x
+          # 钉死 SDK 补丁版本：packages.lock.json 里的 Microsoft.NET.ILLink.Tasks
+          # 版本跟着 SDK 走，镜像升级会让 --locked-mode 恢复失败（NU1004）。
+          # 升级 SDK 时同步跑一次：dotnet restore .\winui\... --force-evaluate 并提交锁文件。
+          dotnet-version: 8.0.426
       - name: Test scanner and clipboard behavior
         shell: pwsh
         run: .\test-winui.ps1

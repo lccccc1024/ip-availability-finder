@@ -15,7 +15,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 8.0.x
+          # 与 ci.yml 保持一致：锁文件里的 ILLink 版本跟着 SDK 补丁走，必须钉住。
+          dotnet-version: 8.0.426
       - name: Test scanner and clipboard behavior
         shell: pwsh
         run: .\test-winui.ps1
